@@ -3432,13 +3432,15 @@ static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& st
 bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSignature)
 {
     // These are checks that are independent of context.
+    const bool IsPoS = block.IsProofOfStake();
+    //LogPrint(BCLog::VALIDATION, "%s: block=%s is %s with type=%i\n", __func__, block.GetHash().ToString(), IsPoS ? "proof of stake" : "proof of work", CBlockHeader::GetAlgoType(block.nVersion) == -1 ? !IsPoS : CBlockHeader::GetAlgoType(block.nVersion));
 
     if (block.fChecked)
         return true;
 
     // Check that the header is valid (particularly PoW).  This is mostly
     // redundant with the call in AcceptBlockHeader.
-    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW && !block.IsProofOfStake()))
+    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
         return false;
 
     // Signet only: check block solution
@@ -3477,14 +3479,27 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         if (block.vtx[i]->IsCoinBase())
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase");
 
-    // only the second transaction can be the optional coinstake
-    for (unsigned int i = 2; i < block.vtx.size(); i++)
+    // peercoin: only the second transaction can be the coinstake
+    if (IsPoS && (block.vtx.size() < 2 || !block.vtx[1]->IsCoinStake()))
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-missing", "second tx is not coinstake");
+    for (unsigned int i = IsPoS ? 2 : 1; i < block.vtx.size(); i++)
         if (block.vtx[i]->IsCoinStake())
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-missing", "coinstake in wrong position");
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-multiple", "coinstake in wrong position");
 
-    // first coinbase output should be empty if proof-of-stake block
-    if (block.IsProofOfStake() && !block.vtx[0]->vout[0].IsEmpty())
+    // peercoin: first coinbase output should be empty if proof-of-stake block
+    const int voutSize = block.vtx[0]->vout.size();
+    if (IsPoS && (voutSize < 1 || voutSize > 2 || block.vtx[0]->GetValueOut() != 0 || !block.vtx[0]->vout[0].IsEmpty() || (voutSize == 2 && (block.vtx[0]->vout[1].scriptPubKey.size() < 1 || block.vtx[0]->vout[1].scriptPubKey[0] != OP_RETURN /*|| block.vtx[0]->vout[1].scriptPubKey.size() > MAX_OP_RETURN_RELAY*/))))
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-notempty", "coinbase output not empty in PoS block");
+
+    // OP_RETURN outputs in coinbase/coinstake must not exceed the max data carrier bytes used in relay policy
+    for (unsigned int i = 0; i <= IsPoS; i++)
+        for (unsigned int j = 0; j < block.vtx[i]->vout.size(); j++)
+            if (block.vtx[i]->vout[j].scriptPubKey.IsUnspendable() && block.vtx[i]->vout[j].scriptPubKey.size() > MAX_OP_RETURN_RELAY)
+                return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-nulldata-size", strprintf("nulldata output %u in %s is too large", j, i ? "coinstake" : "coinbase"));
+
+    // Coinbase/coinstake transaction must be correct version (PoS only)
+    //if (IsPoS && block.nVersion >= CBlockHeader::FIRST_FORK_VERSION && (block.vtx[0]->nVersion < CTransaction::CURRENT_VERSION || (/*IsPoS &&*/ block.vtx[1]->nVersion < CTransaction::CURRENT_VERSION)))
+        //return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-version", "coinbase version is invalid");
 
     // Check transactions
     // Must check for duplicate inputs (see CVE-2018-17144)
@@ -3506,12 +3521,14 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     if (nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST)
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sigops", "out-of-bounds SigOpCount");
 
-    if (fCheckPOW && fCheckMerkleRoot)
-        block.fChecked = true;
-
-    // check block signature
-    if (fCheckMerkleRoot && fCheckSignature && (block.IsProofOfStake() && !CheckBlockSignature(block)))
+    // peercoin: check block signature
+    // Only check block signature if check merkle root, c.f. commit 3cd01fdf
+    // rfc6: validate signatures of proof of stake blocks only after 0.8 fork
+    if (fCheckMerkleRoot && fCheckSignature && IsPoS && !CheckBlockSignature(block))
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-sign", strprintf("%s : bad block signature", __func__));
+
+    if (fCheckPOW && fCheckMerkleRoot && fCheckSignature)
+        block.fChecked = true;
 
     return true;
 }
